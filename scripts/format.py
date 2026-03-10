@@ -6,17 +6,19 @@ Reads a markdown file, applies formatting rules in order, writes the result
 back, and prints a JSON summary of changes to stdout.
 
 Rules (execution order optimized for idempotency):
-  R2: Fix full-width/half-width punctuation by context
+  R2b: Normalize bracket pairs by content (before R2 for stable context)
+  R2: Fix full-width/half-width punctuation by context (brackets excluded)
   R3: Convert full-width digits to half-width
-  R1: Insert space between CJK and Latin/digit characters
+  R1a: Remove spaces between CJK and non-CJK content chars (compact mode)
   R1c: Remove spaces adjacent to full-width punctuation
   R4: Remove consecutive duplicate punctuation (preserve ……)
   R5: Ensure blank line before and after headings
   R6: Normalize list indentation
   R7: Align markdown table columns
+  R8: Align trailing # comments within fenced code blocks
 
-R2/R3 run before R1 so that character substitutions are finalized
-before spacing decisions are made, ensuring single-pass idempotency.
+R2/R3 run before R1a/R1c so that character substitutions are finalized
+before spacing cleanup, ensuring single-pass idempotency.
 """
 
 import json
@@ -31,7 +33,7 @@ from typing import NamedTuple
 # CJK Unified Ideographs + Extension A + Compatibility Ideographs
 CJK = r"\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff"
 
-# CJK full-width punctuation (these should NOT get a space inserted next to CJK)
+# CJK full-width punctuation
 CJK_PUNCT = r"\u3000-\u303f\uff00-\uffef"
 
 # Full-width punctuation used in Chinese context
@@ -75,7 +77,7 @@ class Span(NamedTuple):
     end: int
 
 
-def _find_protected_spans(text: str) -> list[Span]:
+def _find_protected_spans(text: str, *, protect_plain_code_blocks: bool = True) -> list[Span]:
     """Return sorted, non-overlapping spans that must not be modified.
 
     Protected regions (detected in a single pass to avoid overlap issues):
@@ -84,6 +86,10 @@ def _find_protected_spans(text: str) -> list[Span]:
       - Inline code (backtick spans within a single line)
       - URLs
       - Markdown link/image syntax
+
+    If protect_plain_code_blocks is False, fenced code blocks without a
+    language tag (bare ```) are NOT protected, allowing spacing rules to
+    process plain-text content like tree diagrams and descriptions.
     """
     spans: list[Span] = []
 
@@ -98,6 +104,7 @@ def _find_protected_spans(text: str) -> list[Span]:
     in_fence = False
     fence_marker = ""
     fence_start = 0
+    fence_has_lang = False
 
     for line in lines:
         line_start = pos
@@ -112,7 +119,8 @@ def _find_protected_spans(text: str) -> list[Span]:
                 and all(c == fence_marker[0] for c in stripped)
             ):
                 # Close fence: protect from fence_start to end of this line
-                spans.append(Span(fence_start, line_end))
+                if protect_plain_code_blocks or fence_has_lang:
+                    spans.append(Span(fence_start, line_end))
                 in_fence = False
             # else: still inside fence, continue
         else:
@@ -126,6 +134,7 @@ def _find_protected_spans(text: str) -> list[Span]:
                 in_fence = True
                 fence_marker = marker[0] * len(marker)  # normalize: same char, same count
                 fence_start = line_start
+                fence_has_lang = bool(info)
             else:
                 # Inline code detection within this line (no cross-line matching)
                 # Handle `` code `` and ` code ` patterns
@@ -136,7 +145,8 @@ def _find_protected_spans(text: str) -> list[Span]:
 
     # If we ended inside a fence (unclosed), protect from fence_start to end
     if in_fence:
-        spans.append(Span(fence_start, len(text)))
+        if protect_plain_code_blocks or fence_has_lang:
+            spans.append(Span(fence_start, len(text)))
 
     # URLs (http/https/ftp)
     for m in re.finditer(r"https?://[^\s\)\]>\"']+|ftp://[^\s\)\]>\"']+", text):
@@ -206,29 +216,65 @@ def _is_cjk_punct(ch: str) -> bool:
             0xFF00 <= cp <= 0xFFEF)
 
 
-def rule_r1_spacing(text: str, spans: list[Span]) -> tuple[str, int]:
-    """R1: Insert space between CJK and Latin/digit characters.
+def rule_r1a_compact_cjk_spacing(text: str, spans: list[Span]) -> tuple[str, int]:
+    """R1a: Remove spaces between CJK and non-CJK content characters (compact mode).
 
-    Does NOT insert space between CJK and full-width punctuation.
+    Produces tighter Chinese-English mixed text by stripping whitespace
+    at CJK↔non-CJK boundaries.
+    e.g. "AI 辅助" → "AI辅助", "30% 偶然" → "30%偶然".
+
+    Covers letters, digits, and common prose symbols (%, ), ], ~, ° etc.).
+    Excludes markdown syntax chars (#, -, *, +, |, >) that need spaces.
     """
     count = 0
 
+    # Non-CJK content chars that should be tight against CJK.
+    # Excludes markdown line-syntax chars: # - * + | >
+    tight = r'A-Za-z0-9%()°~/@&_\[\]'
+
+    # Label pattern: uppercase letter + optional (hyphen/lowercase) + digits
+    # e.g. C1, C2, B-2, R2b, Tier1 — spaces after these should be preserved.
+    def _is_label(seg: str, space_start: int) -> bool:
+        """Check if chars before space_start form a label identifier."""
+        j = space_start - 1
+        if j < 0 or not seg[j].isdigit():
+            return False
+        # Walk back past digits
+        while j >= 0 and seg[j].isdigit():
+            j -= 1
+        if j < 0:
+            return False
+        # Walk back past optional lowercase letters (e.g. R2b)
+        while j >= 0 and seg[j].islower():
+            j -= 1
+        if j < 0:
+            return False
+        # Walk back past optional hyphen
+        if j >= 0 and seg[j] == '-':
+            j -= 1
+        if j < 0:
+            return False
+        # Must land on an uppercase letter
+        return seg[j].isupper()
+
     def process(seg: str) -> str:
         nonlocal count
-        # CJK followed by Latin/digit (no full-width punct in between)
-        seg, n = re.subn(
-            rf"([{CJK}])([A-Za-z0-9])",
-            r"\1 \2",
-            seg,
-        )
+        # Only remove exactly ONE space at CJK↔non-CJK boundaries.
+        # Multiple consecutive spaces (2+) are alignment padding — preserve them.
+        # (A single space has [tight] on one side and [CJK] on the other;
+        #  in "foo   bar", no single space satisfies both lookbehind and lookahead.)
+
+        # CJK + single space + non-CJK content char
+        seg, n = re.subn(r'(?<=[' + CJK + r']) (?=[' + tight + r'])', '', seg)
         count += n
-        # Latin/digit followed by CJK
-        seg, n = re.subn(
-            rf"([A-Za-z0-9])([{CJK}])",
-            r"\1 \2",
-            seg,
-        )
-        count += n
+        # Non-CJK content char + single space + CJK — preserve after labels
+        def _repl(m: re.Match) -> str:
+            nonlocal count
+            if _is_label(seg, m.start()):
+                return m.group()  # keep space
+            count += 1
+            return ''  # remove space
+        seg = re.sub(r'(?<=[' + tight + r']) (?=[' + CJK + r'])', _repl, seg)
         return seg
 
     result = _apply_to_unprotected(text, process, spans)
@@ -253,8 +299,10 @@ def rule_r1c_fw_punct_spacing(text: str, spans: list[Span]) -> tuple[str, int]:
                  FW_LBRACKET + FW_RBRACKET)
     escaped = re.escape(fw_puncts)
 
-    # Content characters: CJK, Latin, digits, full-width punctuation
-    adj = CJK + r'A-Za-z0-9' + escaped
+    # Content characters: CJK, Latin, digits, full-width punctuation,
+    # quotes, and common prose symbols.
+    # Excludes markdown syntax chars (#, -, *, +, |, >) to avoid breaking formatting.
+    adj = CJK + r'A-Za-z0-9"\'`' + escaped
 
     def process(seg: str) -> str:
         nonlocal count
@@ -278,6 +326,13 @@ def rule_r2_punctuation(text: str, spans: list[Span]) -> tuple[str, int]:
     - Full-width punct surrounded by ASCII/Latin -> half-width
     """
     count = 0
+
+    def _is_line_boundary(s: str, pos: int, direction: int) -> bool:
+        """Check if pos+direction is at a line boundary (newline, start/end of string)."""
+        j = pos + direction
+        if j < 0 or j >= len(s):
+            return True
+        return s[j] in ("\n", "\r")
 
     def _has_cjk_nearby(s: str, pos: int, direction: int, window: int = 5) -> bool:
         """Check if there's a CJK character within `window` chars in given direction."""
@@ -336,18 +391,24 @@ def rule_r2_punctuation(text: str, spans: list[Span]) -> tuple[str, int]:
                 elif ch in (",", "?", "!", ";", ":"):
                     left_cjk = _has_cjk_nearby(seg, i, -1)
                     right_cjk = _has_cjk_nearby(seg, i, 1)
+                    # Convert if both sides CJK, or one side CJK and the other is a line boundary
                     if left_cjk and right_cjk:
                         chars[i] = HW_PAIRS[ch]
                         count += 1
-                elif ch in ("(", ")"):
-                    left_cjk = _has_cjk_nearby(seg, i, -1)
-                    right_cjk = _has_cjk_nearby(seg, i, 1)
-                    if left_cjk and right_cjk:
+                    elif left_cjk and _is_line_boundary(seg, i, 1):
                         chars[i] = HW_PAIRS[ch]
                         count += 1
+                    elif right_cjk and _is_line_boundary(seg, i, -1):
+                        chars[i] = HW_PAIRS[ch]
+                        count += 1
+                # Note: ( ) are NOT handled here — R2b decides bracket
+                # width based on content inside the pair, avoiding cycles.
 
             # Full-width -> half-width in English context
             elif ch in FW_TO_HW:
+                # Skip brackets — R2b is the single authority
+                if ch in (FW_LPAREN, FW_RPAREN):
+                    continue
                 left_latin = _has_latin_nearby(seg, i, -1)
                 right_latin = _has_latin_nearby(seg, i, 1)
                 left_cjk = _has_cjk_nearby(seg, i, -1)
@@ -364,13 +425,13 @@ def rule_r2_punctuation(text: str, spans: list[Span]) -> tuple[str, int]:
 
 
 def rule_r2b_bracket_pairing(text: str, spans: list[Span]) -> tuple[str, int]:
-    """R2b: Fix mismatched bracket pairs.
+    """R2b: Normalize bracket pairs by content.
 
-    After R2 converts individual brackets by context, open/close brackets
-    may end up mismatched (e.g., （...） or (...）).  This pass uses a
-    stack to pair brackets and normalizes each pair:
+    Uses a stack to pair brackets and normalizes each pair:
       - Content contains CJK -> full-width （）
       - Content is pure ASCII  -> half-width ()
+
+    R2b is the single authority on bracket width (R2 does not touch brackets).
     """
     count = 0
 
@@ -386,10 +447,7 @@ def rule_r2b_bracket_pairing(text: str, spans: list[Span]) -> tuple[str, int]:
                 if not stack:
                     continue
                 open_pos, open_ch = stack.pop()
-                # Already matched?
-                if (open_ch == "(" and ch == ")") or (open_ch == "\uff08" and ch == "\uff09"):
-                    continue
-                # Mismatched — decide width from content between brackets
+                # Decide width from content between brackets
                 content = "".join(chars[open_pos + 1 : i])
                 use_fullwidth = any(_is_cjk(c) for c in content)
                 if use_fullwidth:
@@ -758,38 +816,138 @@ def rule_r7_table_alignment(text: str) -> tuple[str, int]:
     return "\n".join(result), count
 
 
+def rule_r8_code_comment_alignment(text: str) -> tuple[str, int]:
+    """R8: Align trailing # comments within each fenced code block.
+
+    All trailing # comments in a block align to the same column:
+    max(command_display_width) + 4.
+    Different code blocks are aligned independently.
+    Blocks with fewer than 2 trailing comments are skipped.
+    """
+    lines = text.split("\n")
+    result = list(lines)
+    count = 0
+    in_code_block = False
+    fence_char = ""
+    fence_len = 0
+    block_start = -1
+
+    def dw(s: str) -> int:
+        """Display width: CJK/full-width chars count as 2."""
+        w = 0
+        for ch in s:
+            cp = ord(ch)
+            if (_is_cjk(ch) or _is_cjk_punct(ch) or
+                    0x2E80 <= cp <= 0x9FFF or
+                    0xF900 <= cp <= 0xFAFF or
+                    0xFE30 <= cp <= 0xFE4F or
+                    0xFF00 <= cp <= 0xFFEF):
+                w += 2
+            else:
+                w += 1
+        return w
+
+    def split_trailing_comment(line: str):
+        """Return (command, comment) or None.
+
+        Skips # inside single/double quotes.  Returns None for
+        comment-only lines (first non-whitespace char is #).
+        """
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            return None
+        in_sq = False
+        in_dq = False
+        i = 0
+        while i < len(line):
+            ch = line[i]
+            if ch == "\\" and in_dq:
+                i += 2
+                continue
+            if ch == "'" and not in_dq:
+                in_sq = not in_sq
+            elif ch == '"' and not in_sq:
+                in_dq = not in_dq
+            elif ch == "#" and not in_sq and not in_dq:
+                if i > 0 and line[i - 1] in (" ", "\t"):
+                    cmd = line[:i].rstrip()
+                    if cmd.strip():
+                        return cmd, line[i:]
+            i += 1
+        return None
+
+    def align_block(start: int, end: int):
+        nonlocal count
+        info = []
+        for li in range(start, end):
+            parts = split_trailing_comment(result[li])
+            if parts:
+                info.append((li, parts[0], parts[1]))
+
+        if len(info) < 2:
+            return
+
+        max_w = max(dw(cmd) for _, cmd, _ in info)
+        col = max_w + 4
+
+        for li, cmd, comment in info:
+            pad = col - dw(cmd)
+            new_line = cmd + " " * pad + comment
+            if result[li] != new_line:
+                result[li] = new_line
+                count += 1
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        if not in_code_block:
+            m = re.match(r"^(`{3,}|~{3,})", stripped)
+            if m:
+                in_code_block = True
+                fence_char = m.group(1)[0]
+                fence_len = len(m.group(1))
+                block_start = i + 1
+        else:
+            if (stripped
+                    and all(c == fence_char for c in stripped)
+                    and len(stripped) >= fence_len):
+                align_block(block_start, i)
+                in_code_block = False
+
+    return "\n".join(result), count
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def format_document(text: str) -> tuple[str, dict[str, int]]:
-    """Apply all formatting rules in order and return (formatted_text, change_counts)."""
+def _format_pass(text: str) -> tuple[str, dict[str, int]]:
+    """Single pass of all formatting rules. Returns (text, per-rule change counts)."""
     changes: dict[str, int] = {}
 
-    # Run character-level transformations (R2, R3) before spacing (R1)
-    # so that R1 sees the final characters when deciding where to add spaces.
-
-    # R2: Punctuation context fix
-    spans = _find_protected_spans(text)
-    text, n = rule_r2_punctuation(text, spans)
-    changes["R2_punctuation"] = n
-
-    # R2b: Fix mismatched bracket pairs (must run after R2)
+    # R2b: Normalize bracket pairs by content (before R2 for stable context)
     spans = _find_protected_spans(text)
     text, n = rule_r2b_bracket_pairing(text, spans)
     changes["R2b_bracket_pairing"] = n
+
+    # R2: Punctuation context fix (brackets excluded — handled by R2b)
+    spans = _find_protected_spans(text)
+    text, n = rule_r2_punctuation(text, spans)
+    changes["R2_punctuation"] = n
 
     # R3: Full-width digits
     spans = _find_protected_spans(text)
     text, n = rule_r3_fullwidth_digits(text, spans)
     changes["R3_digits"] = n
 
-    # R1: CJK-Latin spacing (after R2/R3 so all characters are finalized)
-    spans = _find_protected_spans(text)
-    text, n = rule_r1_spacing(text, spans)
-    changes["R1_spacing"] = n
+    # R1a: Remove CJK↔non-CJK spaces (compact mode)
+    # Plain code blocks (no language tag) are not protected — their content
+    # is typically tree diagrams or descriptions, not executable code.
+    spans = _find_protected_spans(text, protect_plain_code_blocks=False)
+    text, n = rule_r1a_compact_cjk_spacing(text, spans)
+    changes["R1a_compact_spacing"] = n
 
-    # R1c: Remove spaces around full-width punctuation (cleanup after R1)
+    # R1c: Remove spaces around full-width punctuation
     spans = _find_protected_spans(text)
     text, n = rule_r1c_fw_punct_spacing(text, spans)
     changes["R1c_fw_punct_spacing"] = n
@@ -799,19 +957,39 @@ def format_document(text: str) -> tuple[str, dict[str, int]]:
     text, n = rule_r4_duplicate_punctuation(text, spans)
     changes["R4_dedup_punct"] = n
 
-    # R5: Heading spacing (line-based, handles code blocks internally)
+    # R5: Heading spacing
     text, n = rule_r5_heading_spacing(text)
     changes["R5_heading_spacing"] = n
 
-    # R6: List indentation (line-based, handles code blocks internally)
+    # R6: List indentation
     text, n = rule_r6_list_indentation(text)
     changes["R6_list_indent"] = n
 
-    # R7: Table alignment (line-based, handles code blocks internally)
+    # R7: Table alignment
     text, n = rule_r7_table_alignment(text)
     changes["R7_table_align"] = n
 
+    # R8: Code block comment alignment
+    text, n = rule_r8_code_comment_alignment(text)
+    changes["R8_comment_align"] = n
+
     return text, changes
+
+
+def format_document(text: str) -> tuple[str, dict[str, int]]:
+    """Apply formatting rules, iterating until convergence (max 5 passes).
+
+    Cross-rule dependencies (e.g. R1a removing spaces changes R2 context)
+    may require multiple passes.  Typically converges in 1-2 passes.
+    """
+    total: dict[str, int] = {}
+    for _ in range(5):
+        text, changes = _format_pass(text)
+        for k, v in changes.items():
+            total[k] = total.get(k, 0) + v
+        if sum(changes.values()) == 0:
+            break
+    return text, total
 
 
 # ---------------------------------------------------------------------------
