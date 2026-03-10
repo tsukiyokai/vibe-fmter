@@ -156,6 +156,10 @@ def _find_protected_spans(text: str, *, protect_plain_code_blocks: bool = True) 
     for m in re.finditer(r"!?\[[^\]]*\]\([^\)]+\)", text):
         spans.append(Span(m.start(), m.end()))
 
+    # GFM task list checkboxes: - [ ] or - [x] (include trailing space)
+    for m in re.finditer(r"^(\s*[-*+] \[[x ]\] )", text, re.MULTILINE):
+        spans.append(Span(m.start(), m.end()))
+
     # Sort and merge overlapping spans
     spans.sort()
     merged: list[Span] = []
@@ -268,10 +272,16 @@ def rule_r1a_compact_cjk_spacing(text: str, spans: list[Span]) -> tuple[str, int
         seg, n = re.subn(r'(?<=[' + CJK + r']) (?=[' + tight + r'])', '', seg)
         count += n
         # Non-CJK content char + single space + CJK — preserve after labels
+        # unless followed by a function word (particle) that binds tightly.
+        _particles = set('的与和是为可级类在')
+
         def _repl(m: re.Match) -> str:
             nonlocal count
             if _is_label(seg, m.start()):
-                return m.group()  # keep space
+                # Label detected — but if next char is a particle, stay compact
+                next_ch = seg[m.end()] if m.end() < len(seg) else ''
+                if next_ch not in _particles:
+                    return m.group()  # content word after label — keep space
             count += 1
             return ''  # remove space
         seg = re.sub(r'(?<=[' + tight + r']) (?=[' + CJK + r'])', _repl, seg)
@@ -389,18 +399,18 @@ def rule_r2_punctuation(text: str, spans: list[Span]) -> tuple[str, int]:
                         chars[i] = HW_PAIRS[ch]
                         count += 1
                 elif ch in (",", "?", "!", ";", ":"):
-                    left_cjk = _has_cjk_nearby(seg, i, -1)
-                    right_cjk = _has_cjk_nearby(seg, i, 1)
-                    # Convert if both sides CJK, or one side CJK and the other is a line boundary
-                    if left_cjk and right_cjk:
+                    # Punctuation belongs to the clause it terminates.
+                    # Immediate left char is CJK or full-width punct → Chinese context → full-width.
+                    left_imm_cjk = (i > 0 and (_is_cjk(seg[i - 1]) or _is_cjk_punct(seg[i - 1])))
+                    if left_imm_cjk:
                         chars[i] = HW_PAIRS[ch]
                         count += 1
-                    elif left_cjk and _is_line_boundary(seg, i, 1):
-                        chars[i] = HW_PAIRS[ch]
-                        count += 1
-                    elif right_cjk and _is_line_boundary(seg, i, -1):
-                        chars[i] = HW_PAIRS[ch]
-                        count += 1
+                    else:
+                        # Fallback: right side CJK + left side is line boundary
+                        right_cjk = _has_cjk_nearby(seg, i, 1)
+                        if right_cjk and _is_line_boundary(seg, i, -1):
+                            chars[i] = HW_PAIRS[ch]
+                            count += 1
                 # Note: ( ) are NOT handled here — R2b decides bracket
                 # width based on content inside the pair, avoiding cycles.
 
@@ -409,14 +419,17 @@ def rule_r2_punctuation(text: str, spans: list[Span]) -> tuple[str, int]:
                 # Skip brackets — R2b is the single authority
                 if ch in (FW_LPAREN, FW_RPAREN):
                     continue
-                left_latin = _has_latin_nearby(seg, i, -1)
-                right_latin = _has_latin_nearby(seg, i, 1)
-                left_cjk = _has_cjk_nearby(seg, i, -1)
-                right_cjk = _has_cjk_nearby(seg, i, 1)
-                # Only convert if both sides are Latin/digit and neither side is CJK
-                if left_latin and right_latin and not left_cjk and not right_cjk:
-                    chars[i] = FW_TO_HW[ch]
-                    count += 1
+                # Line-level check: if the line contains ANY CJK character,
+                # it's a Chinese-context line — keep full-width punctuation.
+                # Only convert on pure non-CJK lines.
+                line_start = seg.rfind('\n', 0, i) + 1
+                line_end = seg.find('\n', i)
+                if line_end == -1:
+                    line_end = len(seg)
+                if any(_is_cjk(c) for c in seg[line_start:line_end]):
+                    continue
+                chars[i] = FW_TO_HW[ch]
+                count += 1
 
         return "".join(chars)
 
