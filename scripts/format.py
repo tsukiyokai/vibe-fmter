@@ -190,18 +190,19 @@ def _is_protected(pos: int, spans: list[Span]) -> bool:
 def _apply_to_unprotected(text: str, fn, spans: list[Span]) -> str:
     """Apply a transformation function only to unprotected regions.
 
-    `fn(segment) -> str` receives an unprotected text segment and returns
-    the replacement.  Protected segments are passed through unchanged.
+    `fn(segment, offset) -> str` receives an unprotected text segment and its
+    start offset in the original text, and returns the replacement.
+    Protected segments are passed through unchanged.
     """
     parts: list[str] = []
     cursor = 0
     for span in spans:
         if cursor < span.start:
-            parts.append(fn(text[cursor:span.start]))
+            parts.append(fn(text[cursor:span.start], cursor))
         parts.append(text[span.start:span.end])
         cursor = span.end
     if cursor < len(text):
-        parts.append(fn(text[cursor:]))
+        parts.append(fn(text[cursor:], cursor))
     return "".join(parts)
 
 
@@ -263,7 +264,32 @@ def rule_r1a_compact_cjk_spacing(text: str, spans: list[Span]) -> tuple[str, int
         # Must land on an uppercase letter
         return seg[j].isupper()
 
-    def process(seg: str) -> str:
+    def _is_section_number(seg: str, space_start: int) -> bool:
+        """Check if chars before space_start form a section number at line start.
+
+        Matches decimal patterns like 9.5, 1.2.3 that appear after heading
+        markers (#) or at the beginning of a line.  Pure integers (no dot)
+        are NOT matched to avoid false positives on "2024 年" etc.
+        """
+        j = space_start - 1
+        if j < 0 or not seg[j].isdigit():
+            return False
+        # Walk back past digits and dots
+        while j >= 0 and (seg[j].isdigit() or seg[j] == '.'):
+            j -= 1
+        number = seg[j + 1:space_start]
+        if '.' not in number:
+            return False
+        # Must be at line start or after heading markers / whitespace
+        while j >= 0 and seg[j] == ' ':
+            j -= 1
+        if j < 0 or seg[j] == '\n':
+            return True
+        if seg[j] == '#':
+            return True
+        return False
+
+    def process(seg: str, _offset: int = 0) -> str:
         nonlocal count
         # Only remove exactly ONE space at CJK↔non-CJK boundaries.
         # Multiple consecutive spaces (2+) are alignment padding — preserve them.
@@ -279,11 +305,28 @@ def rule_r1a_compact_cjk_spacing(text: str, spans: list[Span]) -> tuple[str, int
 
         def _repl(m: re.Match) -> str:
             nonlocal count
+            if _is_section_number(seg, m.start()):
+                return m.group()  # section number at line start — keep space
             if _is_label(seg, m.start()):
                 # Label detected — but if next char is a particle, stay compact
                 next_ch = seg[m.end()] if m.end() < len(seg) else ''
                 if next_ch not in _particles:
-                    return m.group()  # content word after label — keep space
+                    # Only preserve space when label is at line start (definition entry).
+                    # Inline labels (preceded by CJK) should be compact.
+                    j = m.start() - 1
+                    while j >= 0 and seg[j].isdigit():
+                        j -= 1
+                    while j >= 0 and seg[j].islower():
+                        j -= 1
+                    if j >= 0 and seg[j] == '-':
+                        j -= 1
+                    while j >= 0 and seg[j].isupper():
+                        j -= 1
+                    # j is now char before label, or -1 if at start
+                    if j >= 0 and (_is_cjk(seg[j]) or _is_cjk_punct(seg[j])):
+                        count += 1
+                        return ''  # inline after CJK — remove space
+                    return m.group()  # line start — keep space
             count += 1
             return ''  # remove space
         seg = re.sub(r'(?<=[' + tight + r']) (?=[' + CJK + r'])', _repl, seg)
@@ -316,13 +359,20 @@ def rule_r1c_fw_punct_spacing(text: str, spans: list[Span]) -> tuple[str, int]:
     # Excludes markdown syntax chars (#, -, *, +, |, >) to avoid breaking formatting.
     adj = CJK + r'A-Za-z0-9"\'`' + escaped
 
-    def process(seg: str) -> str:
+    def process(seg: str, _offset: int = 0) -> str:
         nonlocal count
         # Remove spaces before full-width punctuation (only after content chars)
         seg, n = re.subn(r'(?<=[' + adj + r']) +([' + escaped + r'])', r'\1', seg)
         count += n
         # Remove spaces after full-width punctuation (only before content chars)
         seg, n = re.subn(r'([' + escaped + r']) +(?=[' + adj + r'])', r'\1', seg)
+        count += n
+        # Edge: trailing spaces after full-width punctuation at segment boundary
+        # (lookahead can't see into the next protected span, e.g. `：  `code``)
+        seg, n = re.subn(r'([' + escaped + r']) +$', r'\1', seg)
+        count += n
+        # Edge: leading spaces before full-width punctuation at segment boundary
+        seg, n = re.subn(r'^ +([' + escaped + r'])', r'\1', seg)
         count += n
         return seg
 
@@ -374,7 +424,7 @@ def rule_r2_punctuation(text: str, spans: list[Span]) -> tuple[str, int]:
             steps += 1
         return False
 
-    def process(seg: str) -> str:
+    def process(seg: str, offset: int = 0) -> str:
         nonlocal count
         chars = list(seg)
         for i, ch in enumerate(chars):
@@ -421,14 +471,15 @@ def rule_r2_punctuation(text: str, spans: list[Span]) -> tuple[str, int]:
                 # Skip brackets — R2b is the single authority
                 if ch in (FW_LPAREN, FW_RPAREN):
                     continue
-                # Line-level check: if the line contains ANY CJK character,
-                # it's a Chinese-context line — keep full-width punctuation.
-                # Only convert on pure non-CJK lines.
-                line_start = seg.rfind('\n', 0, i) + 1
-                line_end = seg.find('\n', i)
+                # Line-level check: if the ORIGINAL line (not just this segment)
+                # contains ANY CJK character, it's a Chinese-context line — keep
+                # full-width.  Use offset to find the actual line in the full text.
+                actual_pos = offset + i
+                line_start = text.rfind('\n', 0, actual_pos) + 1
+                line_end = text.find('\n', actual_pos)
                 if line_end == -1:
-                    line_end = len(seg)
-                if any(_is_cjk(c) for c in seg[line_start:line_end]):
+                    line_end = len(text)
+                if any(_is_cjk(c) for c in text[line_start:line_end]):
                     continue
                 chars[i] = FW_TO_HW[ch]
                 count += 1
@@ -450,7 +501,7 @@ def rule_r2b_bracket_pairing(text: str, spans: list[Span]) -> tuple[str, int]:
     """
     count = 0
 
-    def process(seg: str) -> str:
+    def process(seg: str, _offset: int = 0) -> str:
         nonlocal count
         chars = list(seg)
         stack: list[tuple[int, str]] = []  # (position, char)
@@ -491,7 +542,7 @@ def rule_r3_fullwidth_digits(text: str, spans: list[Span]) -> tuple[str, int]:
     count = 0
     fw_digit_pattern = re.compile("[" + "".join(FW_DIGITS.keys()) + "]")
 
-    def process(seg: str) -> str:
+    def process(seg: str, _offset: int = 0) -> str:
         nonlocal count
 
         def replace_digit(m):
@@ -525,7 +576,7 @@ def rule_r4_duplicate_punctuation(text: str, spans: list[Span]) -> tuple[str, in
         r"([" + re.escape(dedup_chars) + r"])\1+"
     )
 
-    def process(seg: str) -> str:
+    def process(seg: str, _offset: int = 0) -> str:
         nonlocal count
 
         def dedup(m):
@@ -540,7 +591,7 @@ def rule_r4_duplicate_punctuation(text: str, spans: list[Span]) -> tuple[str, in
         return pattern.sub(dedup, seg)
 
     # Also handle '……' separately: it's fine, but '…………' (3+ …) should reduce to ……
-    def process_ellipsis(seg: str) -> str:
+    def process_ellipsis(seg: str, _offset: int = 0) -> str:
         nonlocal count
         def fix_long_ellipsis(m):
             nonlocal count
