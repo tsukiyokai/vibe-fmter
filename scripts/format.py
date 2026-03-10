@@ -90,6 +90,8 @@ def _find_protected_spans(text: str, *, protect_plain_code_blocks: bool = True) 
     If protect_plain_code_blocks is False, fenced code blocks without a
     language tag (bare ```) are NOT protected, allowing spacing rules to
     process plain-text content like tree diagrams and descriptions.
+    Exception: fences with 4+ backticks/tildes are always protected
+    (they wrap nested code blocks in documentation).
     """
     spans: list[Span] = []
 
@@ -134,7 +136,7 @@ def _find_protected_spans(text: str, *, protect_plain_code_blocks: bool = True) 
                 in_fence = True
                 fence_marker = marker[0] * len(marker)  # normalize: same char, same count
                 fence_start = line_start
-                fence_has_lang = bool(info)
+                fence_has_lang = bool(info) or len(marker) >= 4
             else:
                 # Inline code detection within this line (no cross-line matching)
                 # Handle `` code `` and ` code ` patterns
@@ -234,7 +236,7 @@ def rule_r1a_compact_cjk_spacing(text: str, spans: list[Span]) -> tuple[str, int
 
     # Non-CJK content chars that should be tight against CJK.
     # Excludes markdown line-syntax chars: # - * + | >
-    tight = r'A-Za-z0-9%()°~/@&_\[\]'
+    tight = r'A-Za-z0-9%()°~_\[\]'
 
     # Label pattern: uppercase letter + optional (hyphen/lowercase) + digits
     # e.g. C1, C2, B-2, R2b, Tier1 — spaces after these should be preserved.
@@ -954,9 +956,7 @@ def _format_pass(text: str) -> tuple[str, dict[str, int]]:
     changes["R3_digits"] = n
 
     # R1a: Remove CJK↔non-CJK spaces (compact mode)
-    # Plain code blocks (no language tag) are not protected — their content
-    # is typically tree diagrams or descriptions, not executable code.
-    spans = _find_protected_spans(text, protect_plain_code_blocks=False)
+    spans = _find_protected_spans(text)
     text, n = rule_r1a_compact_cjk_spacing(text, spans)
     changes["R1a_compact_spacing"] = n
 
