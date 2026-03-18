@@ -6,6 +6,7 @@ Reads a markdown file, applies formatting rules in order, writes the result
 back, and prints a JSON summary of changes to stdout.
 
 Rules (execution order optimized for idempotency):
+  R0:  Join PDF-wrapped lines (--join-lines flag, pre-processing)
   R2b: Normalize bracket pairs by content (before R2 for stable context)
   R2: Fix full-width/half-width punctuation by context (brackets excluded)
   R3: Convert full-width digits to half-width
@@ -15,7 +16,9 @@ Rules (execution order optimized for idempotency):
   R5: Ensure blank line before and after headings
   R6: Normalize list indentation
   R7: Align markdown table columns
-  R8: Align trailing # comments within fenced code blocks
+  R8: Align trailing #|// comments within fenced code blocks
+  R9: Wrap bare URLs in <> when followed by full-width chars
+  R10: Unify list markers to -
 
 R2/R3 run before R1a/R1c so that character substitutions are finalized
 before spacing cleanup, ensuring single-pass idempotency.
@@ -204,6 +207,126 @@ def _apply_to_unprotected(text: str, fn, spans: list[Span]) -> str:
     if cursor < len(text):
         parts.append(fn(text[cursor:], cursor))
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# R0: Join PDF-wrapped lines (pre-processing, opt-in via --join-lines)
+# ---------------------------------------------------------------------------
+
+def _r0_is_special_line(line: str) -> bool:
+    """Lines that should never be joined: headings, separators, lists, metadata."""
+    s = line.strip()
+    if not s:
+        return True
+    if s.startswith("#"):                          # heading
+        return True
+    if s == "---" or s == "***" or s == "___":     # separator
+        return True
+    if re.match(r"^\d{4}-\d{2}-\d{2}\s*\|", s):   # date metadata
+        return True
+    if re.match(r"^\d+\.\s", s):                   # ordered list
+        return True
+    if re.match(r"^[-*+]\s", s):                   # unordered list
+        return True
+    if re.match(r"^>", s):                         # blockquote
+        return True
+    if re.match(r"^```", s):                       # code fence
+        return True
+    return False
+
+
+def _r0_should_join(line: str) -> bool:
+    """Whether line was likely soft-wrapped by PDF renderer (ends mid-sentence)."""
+    s = line.rstrip()
+    if not s:
+        return False
+    last = s[-1]
+    # CJK ideograph: definitely mid-sentence
+    cp = ord(last)
+    if 0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or 0xF900 <= cp <= 0xFAFF:
+        return True
+    # ASCII letter or digit: mid-word/sentence
+    if last.isascii() and (last.isalpha() or last.isdigit()):
+        return True
+    # Mid-sentence CJK punctuation (comma, enumeration comma, semicolon, colon,
+    # opening brackets/quotes — sentence continues on next line)
+    if last in "，、；：（「『【〈《":
+        return True
+    return False
+
+
+def _r0_peek_next_content(lines: list[str], start: int) -> tuple[int, str]:
+    """Find next non-blank line from start. Returns (index, stripped_content).
+
+    Returns (len(lines), '') if no content line found.
+    """
+    j = start
+    while j < len(lines) and not lines[j].strip():
+        j += 1
+    if j < len(lines):
+        return j, lines[j].strip()
+    return len(lines), ""
+
+
+def rule_r0_join_wrapped_lines(text: str) -> tuple[str, int]:
+    """R0: Join PDF-extracted soft line breaks back into paragraphs.
+
+    Heuristic: if a line ends with a non-terminal character (CJK ideograph,
+    letter, digit, or mid-sentence punctuation), it was soft-wrapped by the
+    PDF renderer. Join with the next content line, skipping spurious blank
+    lines that PDF extraction may insert between visual lines.
+    """
+    lines = text.split("\n")
+    result: list[str] = []
+    joins = 0
+    i = 0
+    in_code_block = False
+    while i < len(lines):
+        line = lines[i]
+        # Don't touch content inside code blocks
+        if re.match(r"^\s*```", line):
+            in_code_block = not in_code_block
+            result.append(line)
+            i += 1
+            continue
+        if in_code_block or _r0_is_special_line(line):
+            result.append(line)
+            i += 1
+            continue
+        # Accumulate joinable lines, skipping fake blank lines
+        while _r0_should_join(line) and i + 1 < len(lines):
+            next_idx, next_content = _r0_peek_next_content(lines, i + 1)
+            if not next_content or _r0_is_special_line(next_content):
+                break
+            line = line.rstrip() + next_content
+            blanks_skipped = next_idx - (i + 1)
+            joins += 1 + blanks_skipped  # count blank lines removed too
+            i = next_idx
+        result.append(line)
+        i += 1
+    return "\n".join(result), joins
+
+
+# ---------------------------------------------------------------------------
+# R10: Unify list markers
+# ---------------------------------------------------------------------------
+
+def rule_r10_unify_list_markers(text: str) -> tuple[str, int]:
+    """R10: Replace * and + list markers with - for consistency."""
+    lines = text.split("\n")
+    result: list[str] = []
+    changes = 0
+    in_code_block = False
+    for line in lines:
+        if re.match(r"^\s*```", line):
+            in_code_block = not in_code_block
+        if not in_code_block:
+            m = re.match(r"^(\s*)[*+](\s)", line)
+            if m:
+                line = m.group(1) + "-" + m.group(2) + line[m.end():]
+                changes += 1
+        result.append(line)
+    return "\n".join(result), changes
 
 
 # ---------------------------------------------------------------------------
@@ -889,13 +1012,39 @@ def rule_r7_table_alignment(text: str) -> tuple[str, int]:
 
 
 def rule_r8_code_comment_alignment(text: str) -> tuple[str, int]:
-    """R8: Align trailing # comments within each fenced code block.
+    """R8: Align trailing comments within each fenced code block.
 
-    All trailing # comments in a block align to the same column:
+    Supports both '#' comments (shell/Python/Ruby/...) and '//' comments
+    (C/C++/Java/Go/Rust/JS/TS/...).  The comment marker is chosen
+    automatically from the fenced code block's language tag; blocks
+    without a language tag default to '#'.
+
+    All trailing comments in a block align to the same column:
     max(command_display_width) + 4.
     Different code blocks are aligned independently.
     Blocks with fewer than 2 trailing comments are skipped.
     """
+
+    # Language tag -> comment marker mapping
+    HASH_LANGS = {
+        'bash', 'sh', 'zsh', 'python', 'py', 'ruby', 'rb', 'yaml', 'yml',
+        'toml', 'perl', 'pl', 'r', 'makefile', 'make', 'dockerfile',
+        'powershell', 'ps1', 'elixir', 'ex',
+    }
+    SLASH_LANGS = {
+        'cpp', 'c', 'cc', 'cxx', 'h', 'hpp', 'java', 'go', 'rust', 'rs',
+        'js', 'javascript', 'ts', 'typescript', 'tsx', 'jsx', 'swift',
+        'kotlin', 'kt', 'scala', 'cs', 'csharp', 'dart', 'php', 'zig',
+        'v', 'groovy', 'proto', 'protobuf', 'd', 'objc', 'objective-c',
+    }
+
+    def _marker_for_lang(lang: str) -> str:
+        """Return '#' or '//' based on the language tag, defaulting to '#'."""
+        tag = lang.lower().strip() if lang else ''
+        if tag in SLASH_LANGS:
+            return '//'
+        return '#'
+
     lines = text.split("\n")
     result = list(lines)
     count = 0
@@ -903,6 +1052,7 @@ def rule_r8_code_comment_alignment(text: str) -> tuple[str, int]:
     fence_char = ""
     fence_len = 0
     block_start = -1
+    block_marker = "#"
 
     def dw(s: str) -> int:
         """Display width: CJK/full-width chars count as 2."""
@@ -919,14 +1069,15 @@ def rule_r8_code_comment_alignment(text: str) -> tuple[str, int]:
                 w += 1
         return w
 
-    def split_trailing_comment(line: str):
+    def split_trailing_comment(line: str, marker: str):
         """Return (command, comment) or None.
 
-        Skips # inside single/double quotes.  Returns None for
-        comment-only lines (first non-whitespace char is #).
+        `marker` is '#' or '//'.
+        Skips markers inside single/double quotes.  Returns None for
+        comment-only lines (first non-whitespace char is the marker).
         """
         stripped = line.lstrip()
-        if not stripped or stripped.startswith("#"):
+        if not stripped or stripped.startswith(marker):
             return None
         in_sq = False
         in_dq = False
@@ -940,19 +1091,25 @@ def rule_r8_code_comment_alignment(text: str) -> tuple[str, int]:
                 in_sq = not in_sq
             elif ch == '"' and not in_sq:
                 in_dq = not in_dq
-            elif ch == "#" and not in_sq and not in_dq:
-                if i > 0 and line[i - 1] in (" ", "\t"):
-                    cmd = line[:i].rstrip()
-                    if cmd.strip():
-                        return cmd, line[i:]
+            elif not in_sq and not in_dq:
+                if marker == '#' and ch == '#':
+                    if i > 0 and line[i - 1] in (" ", "\t"):
+                        cmd = line[:i].rstrip()
+                        if cmd.strip():
+                            return cmd, line[i:]
+                elif marker == '//' and ch == '/' and i + 1 < len(line) and line[i + 1] == '/':
+                    if i > 0 and line[i - 1] in (" ", "\t"):
+                        cmd = line[:i].rstrip()
+                        if cmd.strip():
+                            return cmd, line[i:]
             i += 1
         return None
 
-    def align_block(start: int, end: int):
+    def align_block(start: int, end: int, marker: str):
         nonlocal count
         info = []
         for li in range(start, end):
-            parts = split_trailing_comment(result[li])
+            parts = split_trailing_comment(result[li], marker)
             if parts:
                 info.append((li, parts[0], parts[1]))
 
@@ -973,25 +1130,77 @@ def rule_r8_code_comment_alignment(text: str) -> tuple[str, int]:
         stripped = line.strip()
 
         if not in_code_block:
-            m = re.match(r"^(`{3,}|~{3,})", stripped)
+            m = re.match(r"^(`{3,}|~{3,})(.*)", stripped)
             if m:
                 in_code_block = True
                 fence_char = m.group(1)[0]
                 fence_len = len(m.group(1))
                 block_start = i + 1
+                # Extract language tag (first word of info string)
+                info_str = m.group(2).strip()
+                lang = info_str.split()[0] if info_str else ''
+                block_marker = _marker_for_lang(lang)
         else:
             if (stripped
                     and all(c == fence_char for c in stripped)
                     and len(stripped) >= fence_len):
-                align_block(block_start, i)
+                align_block(block_start, i, block_marker)
                 in_code_block = False
 
     return "\n".join(result), count
 
 
-# ---------------------------------------------------------------------------
-# Pipeline
-# ---------------------------------------------------------------------------
+def rule_r9_bare_url_boundary(text: str) -> tuple[str, int]:
+    """R9: Wrap bare URLs in <> when immediately followed by full-width chars.
+
+    Markdown autolink extensions (GFM etc.) greedily extend bare URLs
+    into adjacent full-width characters (CJK, full-width punctuation),
+    producing broken links.  Wrapping the URL in <> gives an explicit
+    boundary that all renderers respect.
+
+    Example:  https://example.com/（注释）  →  <https://example.com/>（注释）
+    """
+    lines = text.split("\n")
+    result = list(lines)
+    count = 0
+    in_code_block = False
+
+    # Full-width character ranges (CJK + full-width punctuation)
+    fw = CJK + CJK_PUNCT
+
+    # Bare URL (ASCII-only path) immediately followed by a full-width char.
+    # Lookbehind excludes URLs already wrapped in <> or inside markdown (url).
+    pat = re.compile(
+        r'(?<![<(])'
+        r'(https?://[^\s<>' + fw + r']+)'
+        r'(?=[' + fw + r'])'
+    )
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        if re.match(r'^(`{3,}|~{3,})', stripped):
+            in_code_block = not in_code_block
+            continue
+
+        if in_code_block:
+            continue
+
+        # Protect inline code spans from modification
+        code_spans = [(m.start(), m.end())
+                      for m in re.finditer(r'(`{1,2})(?!`)(.*?[^`])\1(?!`)', line)]
+
+        def _replace(m, _spans=code_spans):
+            nonlocal count
+            for cs, ce in _spans:
+                if cs <= m.start() < ce:
+                    return m.group(0)
+            count += 1
+            return '<' + m.group(1) + '>'
+
+        result[i] = pat.sub(_replace, line)
+
+    return "\n".join(result), count
 
 def _format_pass(text: str) -> tuple[str, dict[str, int]]:
     """Single pass of all formatting rules. Returns (text, per-rule change counts)."""
@@ -1047,6 +1256,14 @@ def _format_pass(text: str) -> tuple[str, dict[str, int]]:
     text, n = rule_r8_code_comment_alignment(text)
     changes["R8_comment_align"] = n
 
+    # R9: Bare URL boundary protection
+    text, n = rule_r9_bare_url_boundary(text)
+    changes["R9_url_boundary"] = n
+
+    # R10: Unify list markers
+    text, n = rule_r10_unify_list_markers(text)
+    changes["R10_list_markers"] = n
+
     return text, changes
 
 
@@ -1071,11 +1288,18 @@ def format_document(text: str) -> tuple[str, dict[str, int]]:
 # ---------------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: format.py <file>", file=sys.stderr)
+    join_lines = False
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    flags = [a for a in sys.argv[1:] if a.startswith("-")]
+
+    if "--join-lines" in flags or "-j" in flags:
+        join_lines = True
+
+    if not args:
+        print("Usage: format.py [-j|--join-lines] <file>", file=sys.stderr)
         sys.exit(1)
 
-    filepath = sys.argv[1]
+    filepath = args[0]
 
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -1087,7 +1311,16 @@ def main():
         print(f"Error reading file: {e}", file=sys.stderr)
         sys.exit(1)
 
-    formatted, changes = format_document(original)
+    changes: dict[str, int] = {}
+
+    # R0: Pre-processing — join PDF-wrapped lines (opt-in)
+    text = original
+    if join_lines:
+        text, n = rule_r0_join_wrapped_lines(text)
+        changes["R0_join_lines"] = n
+
+    formatted, fmt_changes = format_document(text)
+    changes.update(fmt_changes)
 
     # Write back
     with open(filepath, "w", encoding="utf-8") as f:
